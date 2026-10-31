@@ -6,10 +6,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
+  adapterExecutionTargetDuplexObservabilityRecorder,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
+  adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
@@ -19,6 +22,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
+  startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -303,6 +307,8 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     onLog,
   });
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let remoteRuntimeRootDir: string | null = null;
   // Declared here (not inside the try) so the outer `finally` can remove it on
   // every exit path (teardown and setup failure alike), mirroring the Codex
   // adapter's `stagedCodexHomeDir` handling.
@@ -468,6 +474,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         executionTargetIsRemote,
         executionCwd: effectiveExecutionCwd,
       });
+      remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
       // Set GROK_HOME after the refresh above, so the refresh cannot overwrite
       // it. The fixed fallback path mirrors `prepareAdapterExecutionTargetRuntime`'s
       // own `home` asset layout, in case `assetDirs.home` is absent.
@@ -479,6 +486,20 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     }
 
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
+    if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
+      paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target: runtimeExecutionTarget,
+        enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
+        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
+        runtimeRootDir: remoteRuntimeRootDir,
+        adapterKey: "grok",
+        timeoutSec,
+        hostApiToken: env["PAPERCLIP_API_KEY"],
+        onLog,
+      });
+      if (paperclipBridge) Object.assign(env, paperclipBridge.env);
+    }
     const effectiveEnv = Object.fromEntries(
       Object.entries({ ...process.env, ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -629,6 +650,8 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
         onLog,
+        runLogTail: paperclipBridge?.runLogTail,
+        settleRunDisposition: paperclipBridge?.settleRunDisposition,
       });
       return {
         proc,
@@ -756,7 +779,9 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
           resultJson: { ...result.resultJson, instructionCollectionFailure: "collection_failed" },
         };
       },
-      async () => { await restoreRemoteWorkspace?.(); },
+      async () => {
+        await Promise.all([paperclipBridge?.stop(), restoreRemoteWorkspace?.()]);
+      },
     );
   } finally {
     // Cleanup runs after settlement on both success and failure.

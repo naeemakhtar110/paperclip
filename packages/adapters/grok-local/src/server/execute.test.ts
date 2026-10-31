@@ -15,14 +15,17 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 const mocks = vi.hoisted(() => {
   const state: {
     isRemote: boolean;
+    usesBridge: boolean;
     prepareRuntimeResult: { workspaceRemoteDir?: string | null; assetDirs?: Record<string, string> } | null;
-  } = { isRemote: false, prepareRuntimeResult: null };
+  } = { isRemote: false, usesBridge: false, prepareRuntimeResult: null };
   return {
     state,
     ensureRuntimeInstalledMock: vi.fn(async () => {}),
     ensureCommandMock: vi.fn(async () => {}),
     resolveCommandForLogsMock: vi.fn(async () => "grok"),
     runProcessMock: vi.fn(),
+    bridgeStopMock: vi.fn(async () => {}),
+    startBridgeMock: vi.fn(),
     prepareRuntimeMock: vi.fn(
       async (input: { assets?: Array<{ key: string; localDir: string; followSymlinks?: boolean }> }) => {
         const override = state.prepareRuntimeResult;
@@ -47,6 +50,8 @@ const {
   resolveCommandForLogsMock,
   runProcessMock,
   prepareRuntimeMock,
+  bridgeStopMock,
+  startBridgeMock,
 } = mocks;
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
@@ -56,6 +61,11 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown, _cwd: string) => target,
   adapterExecutionTargetSessionIdentity: () => ({ kind: mocks.state.isRemote ? "remote" : "local" }),
   adapterExecutionTargetSessionMatches: () => true,
+  adapterExecutionTargetUsesPaperclipBridge: () => mocks.state.usesBridge,
+  adapterExecutionTargetEnablesSandboxDuplexBridge: () => false,
+  adapterExecutionTargetDuplexObservabilityRecorder: () => undefined,
+  startAdapterExecutionTargetPaperclipBridge: (...args: unknown[]) =>
+    (mocks.startBridgeMock as (...args: unknown[]) => unknown)(...args),
   describeAdapterExecutionTarget: () => (mocks.state.isRemote ? "remote" : "local"),
   ensureAdapterExecutionTargetCommandResolvable: (...args: unknown[]) =>
     (mocks.ensureCommandMock as (...args: unknown[]) => unknown)(...args),
@@ -175,6 +185,81 @@ describe("grok_local execute", () => {
     expect((runProcessMock.mock.calls[0][3] as string[]).includes("--resume")).toBe(present);
     expect(result.sessionParams?.sessionId).toBe("next-session");
   });
+  describe("Paperclip bridge", () => {
+    const runLogTail = { tail: true };
+    const settleRunDisposition = vi.fn();
+    function bridgeResult() {
+      return {
+        env: {
+          PAPERCLIP_API_URL: "http://127.0.0.1:41234",
+          PAPERCLIP_API_KEY: "bridge-token",
+        },
+        runLogTail,
+        settleRunDisposition,
+        stop: bridgeStopMock,
+      };
+    }
+
+    it("starts the bridge for a remote target that uses it and runs Grok with the bridge env", async () => {
+      mocks.state.isRemote = true;
+      mocks.state.usesBridge = true;
+      startBridgeMock.mockResolvedValue(bridgeResult());
+      runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+      const ctx = await makeCtx("bridge-remote", await makeTempRoot());
+      ctx.config.env = { XAI_API_KEY: "fixture-key" };
+
+      await execute(ctx);
+
+      expect(startBridgeMock).toHaveBeenCalledOnce();
+      expect(startBridgeMock.mock.calls[0][0]).toMatchObject({
+        runId: "bridge-remote",
+        adapterKey: "grok",
+        hostApiToken: "run-token",
+      });
+      const options = runProcessMock.mock.calls[0][4] as {
+        env: Record<string, string>;
+        runLogTail: unknown;
+        settleRunDisposition: unknown;
+      };
+      expect(options.env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:41234");
+      expect(options.env.PAPERCLIP_API_KEY).toBe("bridge-token");
+      expect(options.runLogTail).toBe(runLogTail);
+      expect(options.settleRunDisposition).toBe(settleRunDisposition);
+      expect(bridgeStopMock).toHaveBeenCalledOnce();
+    });
+
+    it("stops the bridge when the Grok process fails", async () => {
+      mocks.state.isRemote = true;
+      mocks.state.usesBridge = true;
+      startBridgeMock.mockResolvedValue(bridgeResult());
+      runProcessMock.mockRejectedValue(new Error("spawn failed"));
+
+      await expect(execute(await makeCtx("bridge-fail", await makeTempRoot()))).rejects.toThrow("spawn failed");
+
+      expect(bridgeStopMock).toHaveBeenCalledOnce();
+    });
+
+    it("does not start the bridge for a local target", async () => {
+      mocks.state.usesBridge = true;
+      runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+
+      await execute(await makeCtx("bridge-local", await makeTempRoot()));
+
+      expect(startBridgeMock).not.toHaveBeenCalled();
+      const options = runProcessMock.mock.calls[0][4] as { runLogTail?: unknown };
+      expect(options.runLogTail).toBeUndefined();
+    });
+
+    it("does not start the bridge for a remote target that does not use it", async () => {
+      mocks.state.isRemote = true;
+      runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+
+      await execute(await makeCtx("bridge-unused", await makeTempRoot()));
+
+      expect(startBridgeMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("resumes the conversation while rotating runtime tool access", async () => {
     const root = await makeTempRoot();
     runProcessMock.mockResolvedValue(makeSuccessfulRunResult({ sessionId: "existing-session" }));
@@ -220,7 +305,10 @@ describe("grok_local execute", () => {
 
   beforeEach(() => {
     mocks.state.isRemote = false;
+    mocks.state.usesBridge = false;
     mocks.state.prepareRuntimeResult = null;
+    bridgeStopMock.mockClear();
+    startBridgeMock.mockReset();
     ensureRuntimeInstalledMock.mockClear();
     ensureCommandMock.mockClear();
     prepareRuntimeMock.mockClear();
