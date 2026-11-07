@@ -653,7 +653,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return notes;
     })();
 
-    const buildArgs = (sessionFile: string, userPrompt: string): string[] => {
+    const buildArgs = (sessionFile: string): string[] => {
       const args: string[] = [];
 
       // Use JSON mode for structured output with print mode (non-interactive)
@@ -674,9 +674,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (extraArgs.length > 0) args.push(...extraArgs);
       args.push("--extension", attributionExtensionPath);
 
-      // Add the user prompt as the last argument
-      args.push(userPrompt);
-
+      // The user prompt is not an argument: it goes to Pi on stdin (see the
+      // process call below). A heartbeat prompt can carry a long wake payload or
+      // issue thread, and one argv string over the kernel's per-argument limit
+      // (MAX_ARG_STRLEN, 128 KiB on Linux) makes spawn fail with E2BIG before Pi
+      // starts. Pi reads piped stdin as the initial message in print mode.
       return args;
     };
 
@@ -717,7 +719,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionHandoffChars: sessionHandoffNote.length,
         heartbeatPromptChars: attemptRenderedHeartbeatPrompt.length,
       };
-      const args = buildArgs(sessionFile, userPrompt);
+      const args = buildArgs(sessionFile);
       if (onMeta) {
         await onMeta({
           adapterType: "pi_local",
@@ -779,6 +781,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onLog: accountingLog,
         runLogTail: paperclipBridge?.runLogTail,
         settleRunDisposition: paperclipBridge?.settleRunDisposition,
+        stdin: userPrompt,
       });
       await accountingLog.flush();
 
